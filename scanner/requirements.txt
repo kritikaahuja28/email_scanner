@@ -1,0 +1,8 @@
+streamlit
+rx
+requests
+beautifulsoup4
+lxml
+selenium
+webdriver-manager
+urllib3
