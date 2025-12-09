@@ -248,6 +248,17 @@ class EmailScanner:
         url_subject = Subject()
         done_event = threading.Event()
 
+        # Pending task counter to detect idle state. We increment before scheduling
+        # a URL and decrement when its result is processed. When it reaches zero
+        # there are no tasks in-flight and we can finish.
+        self._pending_tasks = 0
+
+        def emit(item):
+            # Increment pending before pushing to the subject to avoid races
+            with self.lock:
+                self._pending_tasks += 1
+            url_subject.on_next(item)
+
         def process(item):
             url, depth = item
             with self.lock:
@@ -288,18 +299,30 @@ class EmailScanner:
         )
 
         def on_next(res):
+            # Always ensure we decrement pending for the task that completed.
+            # We increment pending when scheduling (emit) and decrement here after
+            # any newly discovered links have been scheduled.
             if res.get('skipped'):
+                with self.lock:
+                    self._pending_tasks -= 1
+                    if self._pending_tasks <= 0 or self.pages_scanned >= self.max_pages:
+                        url_subject.on_completed()
                 return
+
             for e in res.get('emails', set()):
                 with self.lock:
                     if e not in self.emails_found:
                         self.emails_found[e] = res['url']
                         print(f"    [!] Found: {e}")
-            # enqueue discovered links
+
+            # enqueue discovered links (increment pending inside emit)
             for link in res.get('links', []):
-                url_subject.on_next(link)
+                emit(link)
+
             with self.lock:
-                if self.pages_scanned >= self.max_pages:
+                # mark this task as complete
+                self._pending_tasks -= 1
+                if self._pending_tasks <= 0 or self.pages_scanned >= self.max_pages:
                     url_subject.on_completed()
 
         def on_error(err):
@@ -311,23 +334,24 @@ class EmailScanner:
 
         subscription = stream.subscribe(on_next=on_next, on_error=on_error, on_completed=on_completed)
 
-        # seed initial URL
-        url_subject.on_next((self.start_url, 0))
+        # seed initial URL (use emit so pending is tracked)
+        emit((self.start_url, 0))
 
         # wait for completion
         done_event.wait()
 
     def save_report(self, pages_scanned):
+        
+
+        # Clean emails before persisting
+        cleaned_map = self._clean_emails_map(self.emails_found)
+        self.emails_found = cleaned_map
         print("\n" + "="*40)
         print("AUDIT COMPLETE")
         print("="*40)
         print(f"Pages scanned: {pages_scanned}")
         print(f"Unique emails found: {len(self.emails_found)}")
         print("-" * 20)
-
-        # Clean emails before persisting
-        cleaned_map = self._clean_emails_map(self.emails_found)
-        self.emails_found = cleaned_map
 
         if self.emails_found:
             filename = 'audit_report.csv'
@@ -379,6 +403,11 @@ class EmailScanner:
             # Remove whitespace around @ and dots
             s = re.sub(r'\s*@\s*', '@', s)
             s = re.sub(r'\s*\.\s*', '.', s)
+
+            # 🔧 NEW: strip "reserved." or "all rights reserved." prefixes
+            # so "reserved.SayHi@domain.com" -> "SayHi@domain.com"
+            s = re.sub(r'^(?:all\s+rights\s+)?reserved\.', '', s, flags=re.IGNORECASE)
+
             s = s.strip("'\"\n\r\t ")
             s = s.lower()
             return s
@@ -387,20 +416,19 @@ class EmailScanner:
         cleaned = {}
         for raw, src in raw_map.items():
             candidate = _clean_str(raw)
-            # If the cleaned string contains an email-like substring, extract it
             m = email_rx.search(candidate)
             if m:
                 email = m.group(0).lower()
                 if email not in cleaned:
                     cleaned[email] = src
             else:
-                # as a last resort try directly on original raw value
                 m2 = email_rx.search(str(raw))
                 if m2:
                     email = m2.group(0).lower()
                     if email not in cleaned:
                         cleaned[email] = src
         return cleaned
+
 
 if __name__ == "__main__":
     import argparse
